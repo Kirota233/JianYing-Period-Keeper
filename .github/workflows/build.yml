@@ -1,0 +1,37 @@
+﻿name: Build EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install -r requirements.txt
+        
+    - name: Build EXE with PyInstaller
+      run: |
+        pyinstaller --noconsole --onefile --name JianyingPeriodKeeper JianyingPeriodKeeper.py
+        
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/JianyingPeriodKeeper.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
