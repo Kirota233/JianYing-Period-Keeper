@@ -28,7 +28,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 AUTH_URL = "https://raw.githubusercontent.com/Kirota233/JianYing-Period-Keeper/master/auth.json"
 API_AUTH_URL = "https://api.github.com/repos/Kirota233/JianYing-Period-Keeper/contents/auth.json?ref=master"
 
@@ -320,11 +320,8 @@ def win_set_clipboard_text(text):
 
 
 # ---------------------------------------------------------------------------
-# 剪贴板实时句读保护器 (Unicode 避头尾粘连与零宽不换行绑定)
+# 剪贴板实时句读保护器 (基于 Unicode CL 属性避头尾禁则与排版绑定)
 # ---------------------------------------------------------------------------
-WJ = '\u2060'  # Unicode U+2060 Word Joiner (零宽不换行连接符)
-
-
 class ClipboardGuard:
     def needs_protection(self, text: str) -> bool:
         if not text:
@@ -334,28 +331,55 @@ class ClipboardGuard:
     def needs_restoration(self, text: str) -> bool:
         if not text:
             return False
-        return (WJ in text) or ('﹒' in text) or ('․' in text) or ('﹐' in text) or ('‚' in text)
+        return any(c in text for c in ('﹒', '﹐', '․', '‚', '\u2060'))
 
     def protect_text(self, text: str) -> str:
         if not text:
             return ''
-        # 1. 规范化还原旧版可能残留的非标标点与连接符，防止多次重复保护时堆叠
-        text = text.replace(WJ, '')
-        text = text.replace('﹒', '。').replace('․', '.').replace('﹐', '，').replace('‚', ',')
+        # 1. 彻底清除旧版本遗留的零宽连接符与非标标点，杜绝任何历史残留
+        text = text.replace('\u2060', '')
+        text = text.replace('․', '.').replace('‚', ',')
 
-        # 2. 剥离标点前异常的多余空白符，并紧密插入零宽连接符 WJ + 映射标点
-        # 彻底解决排版引擎在末尾句号处自动换行、导致最后一行仅剩一个单句号的排版缺陷
-        text = re.sub(r'[ \t\u3000]*。', f'{WJ}﹒', text)
-        text = re.sub(r'[ \t\u3000]*\.', f'{WJ}․', text)
-        text = re.sub(r'[ \t\u3000]*，', f'{WJ}﹐', text)
-        text = re.sub(r'[ \t\u3000]*,', f'{WJ}‚', text)
+        # 2. 剥离标点前异常的多余空白符，并映射为 Unicode CL (Close Punctuation) 类标点
+        # ﹒(U+FE52 Small Full Stop) 与 ﹐(U+FE50 Small Comma) 具有 CL 闭合标点属性：
+        # (1) 不使用任何 Cf 零宽控制符，杜绝底层 ASR 语音模型切词导致的句号前多出空格问题；
+        # (2) 在 Qt/剪映文字排版引擎中天然继承 UAX #14 [^\s] × CL 禁则，
+        #     绝对禁止在标点前单独换行，彻底消除末尾句号落单成行的排版缺陷。
+        text = re.sub(r'[ \t\u3000]*[。.\ufe52]', '﹒', text)
+        text = re.sub(r'[ \t\u3000]*[，,\ufe50]', '﹐', text)
         return text
 
     def restore_text(self, text: str) -> str:
         if not text:
             return ''
-        text = text.replace(WJ, '')
-        text = text.replace('﹒', '。').replace('․', '.').replace('﹐', '，').replace('‚', ',')
+        # 1. 连续 2 个及以上的 ﹒ 还原为标准英文连续省略号 ...
+        text = re.sub(r'﹒{2,}', lambda m: '.' * len(m.group(0)), text)
+
+        # 2. 上下文感知自适应还原：
+        # 处于西文/数字语境时还原为半角 ASCII 标点，处于中文语境时还原为全角标点
+        def repl_dot(m):
+            idx = m.start()
+            start = max(0, idx - 15)
+            end = min(len(text), idx + 15)
+            window = text[start:end]
+            if any('\u4e00' <= c <= '\u9fff' for c in window):
+                return '。'
+            return '.'
+
+        def repl_comma(m):
+            idx = m.start()
+            start = max(0, idx - 15)
+            end = min(len(text), idx + 15)
+            window = text[start:end]
+            if any('\u4e00' <= c <= '\u9fff' for c in window):
+                return '，'
+            return ','
+
+        text = re.sub(r'﹒', repl_dot, text)
+        text = re.sub(r'﹐', repl_comma, text)
+
+        # 兼容清理旧版残留
+        text = text.replace('․', '.').replace('‚', ',').replace('\u2060', '')
         return text
 
 
