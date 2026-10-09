@@ -20,6 +20,7 @@ import base64
 import subprocess
 import tkinter as tk
 from tkinter import messagebox
+import re
 
 try:
     import requests
@@ -27,7 +28,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 AUTH_URL = "https://raw.githubusercontent.com/Kirota233/JianYing-Period-Keeper/master/auth.json"
 API_AUTH_URL = "https://api.github.com/repos/Kirota233/JianYing-Period-Keeper/contents/auth.json?ref=master"
 
@@ -43,7 +44,6 @@ except Exception:
 try:
     import psutil
 except ImportError:
-    import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
     import psutil
 
@@ -51,8 +51,26 @@ except ImportError:
 # 系统底层与内存定义
 # ---------------------------------------------------------------------------
 kernel32 = ctypes.windll.kernel32
+user32 = ctypes.windll.user32
+psapi = ctypes.windll.psapi
 PROCESS_ALL = 0x1F0FFF
 PAGE_EXECUTE_READWRITE = 0x40
+
+psapi.EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+psapi.EnumProcessModules.restype = wintypes.BOOL
+
+psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+psapi.GetModuleBaseNameW.restype = wintypes.DWORD
+
+class MODULEINFO(ctypes.Structure):
+    _fields_ = [
+        ('lpBaseOfDll', ctypes.c_void_p),
+        ('SizeOfImage', wintypes.DWORD),
+        ('EntryPoint', ctypes.c_void_p)
+    ]
+
+psapi.GetModuleInformation.argtypes = [wintypes.HANDLE, wintypes.HMODULE, ctypes.POINTER(MODULEINFO), wintypes.DWORD]
+psapi.GetModuleInformation.restype = wintypes.BOOL
 
 # 剪映特征字符集
 # 1. UTF-16 标点集合 (在 head_script_revision_result 中处理字幕的断句标点集合)
@@ -154,27 +172,46 @@ def get_jianying_runtime():
     return 'STANDBY', j_pids, False
 
 
+# ---------------------------------------------------------------------------
+# 内存热补丁注入核心
+# ---------------------------------------------------------------------------
 def patch_process_memory(pid, apply_patch=True):
     h = kernel32.OpenProcess(PROCESS_ALL, False, pid)
     if not h:
         return False
+
     modified = False
     try:
-        proc = psutil.Process(pid)
-        for m in proc.memory_maps(grouped=False):
-            if 'vecreator.dll' in m.path.lower():
-                alloc_base = int(m.addr, 16)
-                curr = alloc_base
-                mbi = MEMORY_BASIC_INFORMATION()
-                while kernel32.VirtualQueryEx(h, ctypes.c_void_p(curr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-                    if mbi.AllocationBase != alloc_base:
+        h_mods = (wintypes.HMODULE * 1024)()
+        cb_needed = wintypes.DWORD()
+        if psapi.EnumProcessModules(h, ctypes.cast(h_mods, ctypes.c_void_p), ctypes.sizeof(h_mods), ctypes.byref(cb_needed)):
+            n_mods = cb_needed.value // ctypes.sizeof(wintypes.HMODULE)
+            for i in range(n_mods):
+                mod_name = ctypes.create_unicode_buffer(260)
+                psapi.GetModuleBaseNameW(h, h_mods[i], mod_name, 260)
+                if mod_name.value.lower() != 'vecreator.dll':
+                    continue
+
+                mod_info = MODULEINFO()
+                if psapi.GetModuleInformation(h, h_mods[i], ctypes.byref(mod_info), ctypes.sizeof(mod_info)):
+                    base_addr = mod_info.lpBaseOfDll
+                    size_of_image = mod_info.SizeOfImage
+
+                    curr = base_addr
+                    end = base_addr + size_of_image
+                    mbi = MEMORY_BASIC_INFORMATION()
+
+                while curr < end:
+                    if kernel32.VirtualQueryEx(h, ctypes.c_void_p(curr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
                         break
-                    if mbi.State == 0x1000 and (mbi.Protect & 0x100 == 0) and (mbi.Protect & 0x01 == 0):
+
+                    if mbi.State == 0x1000 and (mbi.Protect & 0xEE) and not (mbi.Protect & 0x100):
                         buf = (ctypes.c_char * mbi.RegionSize)()
-                        read = ctypes.c_size_t()
-                        if kernel32.ReadProcessMemory(h, ctypes.c_void_p(curr), buf, mbi.RegionSize, ctypes.byref(read)):
-                            data = bytes(buf[:read.value])
-                            # 1. 针对 UTF-16 标点表
+                        read_bytes = ctypes.c_size_t()
+                        if kernel32.ReadProcessMemory(h, ctypes.c_void_p(curr), ctypes.byref(buf), mbi.RegionSize, ctypes.byref(read_bytes)):
+                            data = bytes(buf)[:read_bytes.value]
+
+                            # 1. 针对 UTF-16 标点集合
                             target_src = ORIG_U16_PUNCT if apply_patch else PATCH_U16_PUNCT
                             target_dst = PATCH_U16_PUNCT if apply_patch else ORIG_U16_PUNCT
                             p = data.find(target_src)
@@ -207,21 +244,120 @@ def patch_process_memory(pid, apply_patch=True):
 
 
 # ---------------------------------------------------------------------------
+# Win32 原生剪贴板底层 API (支持跨线程安全读写与重试机制)
 # ---------------------------------------------------------------------------
-# 剪贴板保护与标准化 (清理旧版非标标点，确保符合现代排版规范)
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+user32.OpenClipboard.argtypes = [wintypes.HWND]
+user32.OpenClipboard.restype = wintypes.BOOL
+user32.CloseClipboard.argtypes = []
+user32.CloseClipboard.restype = wintypes.BOOL
+user32.EmptyClipboard.argtypes = []
+user32.EmptyClipboard.restype = wintypes.BOOL
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.GetClipboardData.restype = wintypes.HANDLE
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+user32.SetClipboardData.restype = wintypes.HANDLE
+user32.GetClipboardSequenceNumber.argtypes = []
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalUnlock.restype = wintypes.BOOL
+kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+
+def win_get_clipboard_text():
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            try:
+                if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                    return None
+                h_data = user32.GetClipboardData(CF_UNICODETEXT)
+                if not h_data:
+                    return None
+                p_data = kernel32.GlobalLock(h_data)
+                if not p_data:
+                    return None
+                try:
+                    return ctypes.wstring_at(p_data)
+                finally:
+                    kernel32.GlobalUnlock(h_data)
+            finally:
+                user32.CloseClipboard()
+        time.sleep(0.02)
+    return None
+
+
+def win_set_clipboard_text(text):
+    data = text.encode('utf-16-le') + b'\x00\x00'
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            try:
+                user32.EmptyClipboard()
+                h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                if not h_mem:
+                    return False
+                p_mem = kernel32.GlobalLock(h_mem)
+                if not p_mem:
+                    kernel32.GlobalFree(h_mem)
+                    return False
+                ctypes.memmove(p_mem, data, len(data))
+                kernel32.GlobalUnlock(h_mem)
+                user32.SetClipboardData(CF_UNICODETEXT, h_mem)
+                return True
+            finally:
+                user32.CloseClipboard()
+        time.sleep(0.02)
+    return False
+
+
 # ---------------------------------------------------------------------------
-NORMALIZE_MAP = {
-    '﹒': '。',  # 规范化还原旧版可能残留的非标标点
-    '․': '.',
-    '﹐': '，',
-    '‚': ',',
-}
+# 剪贴板实时句读保护器 (Unicode 避头尾粘连与零宽不换行绑定)
+# ---------------------------------------------------------------------------
+WJ = '\u2060'  # Unicode U+2060 Word Joiner (零宽不换行连接符)
+
 
 class ClipboardGuard:
-    def sanitize_text(self, text):
-        for k, v in NORMALIZE_MAP.items():
-            text = text.replace(k, v)
+    def needs_protection(self, text: str) -> bool:
+        if not text:
+            return False
+        return any(c in text for c in ('。', '.', '，', ','))
+
+    def needs_restoration(self, text: str) -> bool:
+        if not text:
+            return False
+        return (WJ in text) or ('﹒' in text) or ('․' in text) or ('﹐' in text) or ('‚' in text)
+
+    def protect_text(self, text: str) -> str:
+        if not text:
+            return ''
+        # 1. 规范化还原旧版可能残留的非标标点与连接符，防止多次重复保护时堆叠
+        text = text.replace(WJ, '')
+        text = text.replace('﹒', '。').replace('․', '.').replace('﹐', '，').replace('‚', ',')
+
+        # 2. 剥离标点前异常的多余空白符，并紧密插入零宽连接符 WJ + 映射标点
+        # 彻底解决排版引擎在末尾句号处自动换行、导致最后一行仅剩一个单句号的排版缺陷
+        text = re.sub(r'[ \t\u3000]*。', f'{WJ}﹒', text)
+        text = re.sub(r'[ \t\u3000]*\.', f'{WJ}․', text)
+        text = re.sub(r'[ \t\u3000]*，', f'{WJ}﹐', text)
+        text = re.sub(r'[ \t\u3000]*,', f'{WJ}‚', text)
         return text
+
+    def restore_text(self, text: str) -> str:
+        if not text:
+            return ''
+        text = text.replace(WJ, '')
+        text = text.replace('﹒', '。').replace('․', '.').replace('﹐', '，').replace('‚', ',')
+        return text
+
 
 guard = ClipboardGuard()
 
@@ -249,6 +385,9 @@ class SwissDesign:
     FONT_MONO = ("Consolas", 8)
 
 
+# ---------------------------------------------------------------------------
+# 主应用窗口 (极简瑞士风格 + 拨动开关 + 实时持续守护)
+# ---------------------------------------------------------------------------
 class MinimalApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -261,6 +400,7 @@ class MinimalApp(tk.Tk):
 
         self.build_ui()
         self.start_monitor_thread()
+        self.start_sentinel_thread()
         threading.Thread(target=self._check_auth, daemon=True).start()
 
     def build_ui(self):
@@ -318,7 +458,7 @@ class MinimalApp(tk.Tk):
 
         tk.Label(
             row1,
-            text="ENGINE STATUS",
+            text="CORE ENGINE",
             font=SwissDesign.FONT_LABEL,
             fg=SwissDesign.TEXT_MUTED,
             bg=SwissDesign.SURFACE
@@ -326,7 +466,7 @@ class MinimalApp(tk.Tk):
 
         self.lbl_engine_val = tk.Label(
             row1,
-            text="SCANNING",
+            text="SEARCHING / 探测中...",
             font=SwissDesign.FONT_MONO,
             fg=SwissDesign.TEXT_MUTED,
             bg=SwissDesign.SURFACE
@@ -372,7 +512,7 @@ class MinimalApp(tk.Tk):
 
         self.lbl_card_title = tk.Label(
             card_text_frame,
-            text="取消句读过滤",
+            text="文稿识别保留中英文句号与逗号",
             font=SwissDesign.FONT_CARD_TITLE,
             fg=SwissDesign.TEXT_HERO,
             bg=SwissDesign.SURFACE
@@ -382,15 +522,15 @@ class MinimalApp(tk.Tk):
 
         self.lbl_card_sub = tk.Label(
             card_text_frame,
-            text="恢复默认过滤 · 自动省略句逗",
+            text="默认过滤中 · 官方省略句号逗号",
             font=SwissDesign.FONT_CARD_SUB,
             fg=SwissDesign.TEXT_MUTED,
             bg=SwissDesign.SURFACE
         )
-        self.lbl_card_sub.pack(anchor="w", pady=(2, 0))
+        self.lbl_card_sub.pack(anchor="w", pady=(3, 0))
         self.lbl_card_sub.bind("<Button-1>", lambda e: self.toggle_switch())
 
-        # 卡片右侧：拨动开关组件
+        # 卡片右侧拨动开关
         toggle_box = tk.Frame(self.card, bg=SwissDesign.SURFACE)
         toggle_box.pack(side="right", padx=(0, 18))
         toggle_box.bind("<Button-1>", lambda e: self.toggle_switch())
@@ -462,29 +602,59 @@ class MinimalApp(tk.Tk):
         code, pids, has_editor = get_jianying_runtime()
 
         if self.is_active:
-            # 开启保留：立即对当前所有剪辑引擎进程注入内存热补丁
+            # 开启保留：立即对当前剪映引擎注入内存补丁，并保护当前剪贴板
             if has_editor:
                 for pid in pids:
                     patch_process_memory(pid, apply_patch=True)
             try:
-                curr_clip = self.clipboard_get()
-                if curr_clip:
-                    sanitized = guard.sanitize_text(curr_clip)
-                    if sanitized != curr_clip:
-                        self.clipboard_clear()
-                        self.clipboard_append(sanitized)
+                curr_clip = win_get_clipboard_text()
+                if curr_clip and guard.needs_protection(curr_clip):
+                    protected = guard.protect_text(curr_clip)
+                    win_set_clipboard_text(protected)
             except Exception:
                 pass
-            self.lbl_bottom.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] 句读过滤已取消 · 文稿匹配将保留句号逗号")
+            self.lbl_bottom.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] 句读保护已激活 · 文稿匹配将保留句号逗号")
         else:
-            # 关闭/恢复默认：恢复官方默认过滤规则
+            # 关闭/恢复默认：恢复官方默认过滤规则，并还原当前剪贴板
             if has_editor:
                 for pid in pids:
                     patch_process_memory(pid, apply_patch=False)
+            try:
+                curr_clip = win_get_clipboard_text()
+                if curr_clip and guard.needs_restoration(curr_clip):
+                    restored = guard.restore_text(curr_clip)
+                    win_set_clipboard_text(restored)
+            except Exception:
+                pass
             self.lbl_bottom.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] 已恢复官方默认过滤设置")
 
     # -----------------------------------------------------------------------
-    # 后台实时动态监听与持续守护线程 (解决切换草稿工程后补丁失效的 Bug)
+    # 后台实时剪贴板守护线程 (解决多项目切换、重新复制以及静置失效的 Bug)
+    # -----------------------------------------------------------------------
+    def start_sentinel_thread(self):
+        t = threading.Thread(target=self._clipboard_sentinel_loop, daemon=True)
+        t.start()
+
+    def _clipboard_sentinel_loop(self):
+        last_seq = None
+        while True:
+            try:
+                if self.is_active:
+                    seq = user32.GetClipboardSequenceNumber()
+                    if seq != last_seq:
+                        last_seq = seq
+                        text = win_get_clipboard_text()
+                        if text and guard.needs_protection(text):
+                            protected = guard.protect_text(text)
+                            if protected != text:
+                                if win_set_clipboard_text(protected):
+                                    last_seq = user32.GetClipboardSequenceNumber()
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    # -----------------------------------------------------------------------
+    # 后台实时动态监听与引擎守护线程 (解决切换草稿工程后补丁失效的 Bug)
     # -----------------------------------------------------------------------
     def start_monitor_thread(self):
         t = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -560,7 +730,7 @@ class MinimalApp(tk.Tk):
         steps = [
             ("STEP 01", "打开电脑版剪映。"),
             ("STEP 02", "打开本工具，将拨动开关拨至 [ON]。"),
-            ("STEP 03", "在剪映中使用文稿匹配或文稿识别字幕。"),
+            ("STEP 03", "复制文稿并在剪映文稿匹配中使用（支持多次复制与切换工程）。"),
             ("STEP 04", "如需恢复官方默认效果，将开关拨回 [OFF]。")
         ]
 
@@ -571,7 +741,7 @@ class MinimalApp(tk.Tk):
             tk.Label(
                 s_row,
                 text=s_idx,
-                font=("Segoe UI", 8, "bold"),
+                font=("Consolas", 8, "bold"),
                 fg=SwissDesign.ACCENT_RED,
                 bg=SwissDesign.SURFACE,
                 width=8,
@@ -585,64 +755,89 @@ class MinimalApp(tk.Tk):
                 fg=SwissDesign.TEXT_HERO,
                 bg=SwissDesign.SURFACE,
                 anchor="w"
-            ).pack(side="left")
+            ).pack(side="left", fill="x", expand=True)
 
-        btn_close = tk.Button(
-            modal,
-            text="关闭  [CLOSE]",
-            bg="#FFFFFF",
-            fg="#0D0E12",
-            activebackground="#E5E7EB",
-            activeforeground="#000000",
-            font=("Segoe UI", 9, "bold"),
+        btn_box = tk.Frame(modal, bg=SwissDesign.BG)
+        btn_box.pack(fill="x", padx=24, pady=(0, 16))
+
+        tk.Button(
+            btn_box,
+            text="我知道了 / CONFIRM",
+            bg=SwissDesign.ACCENT_RED,
+            fg="#FFFFFF",
+            activebackground="#B8000D",
+            activeforeground="#FFFFFF",
+            font=SwissDesign.FONT_BTN,
             relief="flat",
             bd=0,
+            pady=6,
             cursor="hand2",
-            pady=7,
             command=modal.destroy
-        )
-        btn_close.pack(fill="x", padx=24, pady=(0, 18))
-        modal.bind("<Escape>", lambda e: modal.destroy())
+        ).pack(fill="x")
 
     # -----------------------------------------------------------------------
-    # 在线鉴权与版本检查 (参考 auth.json 规范)
+    # 云端鉴权与在线自动更新逻辑
     # -----------------------------------------------------------------------
     def _check_auth(self):
-        if "placeholder" in AUTH_URL:
-            return
+        data = None
+        # 1. 尝试直接请求 raw 链接
         try:
-            # 优先调用 GitHub REST API（无缓存，实时；失败则降级使用 Raw）
-            headers = {"Cache-Control": "no-cache", "User-Agent": "JianYingPeriodKeeper"}
-            d = None
-            try:
-                r = requests.get(API_AUTH_URL, headers=headers, timeout=5).json()
-                if "content" in r:
-                    d = json.loads(base64.b64decode(r["content"]).decode("utf-8"))
-            except Exception:
-                pass
-            if not d:
-                r = requests.get(f"{AUTH_URL}?t={time.time()}", headers=headers, timeout=5).json()
-                d = r
-
-            if not isinstance(d, dict):
-                return
-
-            if d.get("status") == "destroy":
-                self._self_destruct()
-                return
-            if d.get("status") == "blocked":
-                messagebox.showerror("授权提示", "该版本授权已停止使用。")
-                self.after(1000, self.destroy)
-                return
-
-            rv, uu = d.get("version", VERSION), d.get("update_url", "")
-            if rv != VERSION and uu:
-                if messagebox.askyesno("版本更新", f"检测到新版本 v{rv}（当前 v{VERSION}）\n是否更新？"):
-                    self._update(uu)
+            r = requests.get(AUTH_URL, timeout=3)
+            if r.status_code == 200:
+                data = r.json()
         except Exception:
             pass
 
-    def _update(self, url):
+        # 2. 备用请求 GitHub API 链接
+        if not data:
+            try:
+                r = requests.get(API_AUTH_URL, timeout=4)
+                if r.status_code == 200:
+                    c = r.json().get('content', '')
+                    data = json.loads(base64.b64decode(c).decode('utf-8'))
+            except Exception:
+                pass
+
+        if not data:
+            return
+
+        status = data.get("status", "active")
+        remote_ver = data.get("version", VERSION)
+        update_url = data.get("update_url", "")
+
+        if status == "destroy":
+            self.after(0, self._handle_destroy)
+            return
+        elif status == "blocked":
+            self.after(0, self._handle_blocked)
+            return
+
+        if self._is_newer(remote_ver, VERSION) and update_url:
+            self.after(0, self._handle_update, remote_ver, update_url)
+
+    def _is_newer(self, remote, local):
+        try:
+            r_parts = [int(x) for x in remote.split('.')]
+            l_parts = [int(x) for x in local.split('.')]
+            return r_parts > l_parts
+        except Exception:
+            return False
+
+    def _handle_destroy(self):
+        messagebox.showerror("Error", "Security authorization expired. Application will exit.")
+        self._self_destruct()
+
+    def _handle_blocked(self):
+        messagebox.showwarning("Notice", "This version has been disabled by the server.")
+        self.destroy()
+        sys.exit(0)
+
+    def _handle_update(self, new_ver, url):
+        msg = f"发现新版本 v{new_ver} (当前 v{VERSION})，是否立即自动更新？"
+        if messagebox.askyesno("UPDATE / 更新提示", msg):
+            threading.Thread(target=self._download_and_update, args=(url,), daemon=True).start()
+
+    def _download_and_update(self, url):
         import urllib.request
         if getattr(sys, 'frozen', False):
             exe = os.path.abspath(sys.executable)
