@@ -27,7 +27,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 AUTH_URL = "https://raw.githubusercontent.com/Kirota233/JianYing-Period-Keeper/master/auth.json"
 API_AUTH_URL = "https://api.github.com/repos/Kirota233/JianYing-Period-Keeper/contents/auth.json?ref=master"
 
@@ -58,8 +58,23 @@ PAGE_EXECUTE_READWRITE = 0x40
 # 1. UTF-16 标点集合 (在 head_script_revision_result 中处理字幕的断句标点集合)
 # 原始：。！？!?；;，,、.\n\r (包含句号与逗号)
 ORIG_U16_PUNCT = b'\x020\x01\xff\x1f\xff!\x00?\x00\x1b\xff;\x00\x0c\xff,\x00\x010.\x00\n\x00\r\x00'
-# 补丁：移除句号(。.)与逗号(，,) -> 保留为感叹号、问号、分号与换行，用 null 占位
-PATCH_U16_PUNCT = b'\x00\x00\x01\xff\x1f\xff!\x00?\x00\x1b\xff;\x00\x00\x00\x00\x00\x010\x00\x00\n\x00\r\x00'
+# 补丁：将 。(U+3002)、.(U+002E)、，(U+FF0C)、,(U+002C) 替换为已存在的感叹号占位
+# 严格保持 26 字节长度，不使用 \x00 提前截断，确保末尾换行符 \n \r 仍能被底层正常清洗规整，避免句号单独分行
+PATCH_U16_PUNCT = (
+    b'\x01\xff'   # 0: ！ (原为 。)
+    b'\x01\xff'   # 1: ！
+    b'\x1f\xff'   # 2: ？
+    b'!\x00'      # 3: !
+    b'?\x00'      # 4: ?
+    b'\x1b\xff'   # 5: ；
+    b';\x00'      # 6: ;
+    b'\x01\xff'   # 7: ！ (原为 ，)
+    b'!\x00'      # 8: !  (原为 ,)
+    b'\x010'      # 9: 、
+    b'!\x00'      # 10: ! (原为 .)
+    b'\n\x00'     # 11: \n
+    b'\r\x00'     # 12: \r
+)
 
 # 2. UTF-8 备用正则特征
 ORIG_U8_REGEX = b'[\xe3\x80\x82\xef\xbc\x9f\xef\xbc\x81\xef\xbc\x9b\xe2\x80\x9c .!?\xef\xbd\x9e]\x00'
@@ -192,28 +207,21 @@ def patch_process_memory(pid, apply_patch=True):
 
 
 # ---------------------------------------------------------------------------
-# 剪贴板保护守护者
 # ---------------------------------------------------------------------------
-PROTECT_MAP = {
-    '。': '﹒',  # U+FE52 小型句号
-    '.': '․',   # U+2024 单点导引符
-    '，': '﹐',  # U+FE50 小型逗号
-    ',': '‚',   # U+201A 单下引号/逗号
+# 剪贴板保护与标准化 (清理旧版非标标点，确保符合现代排版规范)
+# ---------------------------------------------------------------------------
+NORMALIZE_MAP = {
+    '﹒': '。',  # 规范化还原旧版可能残留的非标标点
+    '․': '.',
+    '﹐': '，',
+    '‚': ',',
 }
-RESTORE_MAP = {v: k for k, v in PROTECT_MAP.items()}
-
 
 class ClipboardGuard:
-    def protect_text(self, text):
-        for k, v in PROTECT_MAP.items():
+    def sanitize_text(self, text):
+        for k, v in NORMALIZE_MAP.items():
             text = text.replace(k, v)
         return text
-
-    def restore_text(self, text):
-        for k, v in RESTORE_MAP.items():
-            text = text.replace(k, v)
-        return text
-
 
 guard = ClipboardGuard()
 
@@ -454,36 +462,29 @@ class MinimalApp(tk.Tk):
         code, pids, has_editor = get_jianying_runtime()
 
         if self.is_active:
-            # 开启保留
+            # 开启保留：立即对当前所有剪辑引擎进程注入内存热补丁
             if has_editor:
                 for pid in pids:
                     patch_process_memory(pid, apply_patch=True)
             try:
                 curr_clip = self.clipboard_get()
                 if curr_clip:
-                    protected = guard.protect_text(curr_clip)
-                    self.clipboard_clear()
-                    self.clipboard_append(protected)
+                    sanitized = guard.sanitize_text(curr_clip)
+                    if sanitized != curr_clip:
+                        self.clipboard_clear()
+                        self.clipboard_append(sanitized)
             except Exception:
                 pass
             self.lbl_bottom.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] 句读过滤已取消 · 文稿匹配将保留句号逗号")
         else:
-            # 关闭/恢复默认
+            # 关闭/恢复默认：恢复官方默认过滤规则
             if has_editor:
                 for pid in pids:
                     patch_process_memory(pid, apply_patch=False)
-            try:
-                curr_clip = self.clipboard_get()
-                if curr_clip:
-                    restored = guard.restore_text(curr_clip)
-                    self.clipboard_clear()
-                    self.clipboard_append(restored)
-            except Exception:
-                pass
             self.lbl_bottom.config(text=f"[{datetime.now().strftime('%H:%M:%S')}] 已恢复官方默认过滤设置")
 
     # -----------------------------------------------------------------------
-    # 后台实时动态监听线程
+    # 后台实时动态监听与持续守护线程 (解决切换草稿工程后补丁失效的 Bug)
     # -----------------------------------------------------------------------
     def start_monitor_thread(self):
         t = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -493,10 +494,14 @@ class MinimalApp(tk.Tk):
         while True:
             try:
                 code, pids, has_editor = get_jianying_runtime()
+                # 持续持久守护：当开关开启时，自动检测并对所有新打开的工程进程打上补丁
+                if self.is_active and has_editor:
+                    for pid in pids:
+                        patch_process_memory(pid, apply_patch=True)
                 self.after(0, self._update_ui_state, code, pids, has_editor)
             except Exception:
                 pass
-            time.sleep(1.2)
+            time.sleep(1.0)
 
     def _update_ui_state(self, code, pids, has_editor):
         if code == 'OFFLINE':
