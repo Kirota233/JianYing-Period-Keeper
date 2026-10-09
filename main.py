@@ -28,7 +28,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 AUTH_URL = "https://raw.githubusercontent.com/Kirota233/JianYing-Period-Keeper/master/auth.json"
 API_AUTH_URL = "https://api.github.com/repos/Kirota233/JianYing-Period-Keeper/contents/auth.json?ref=master"
 
@@ -320,7 +320,7 @@ def win_set_clipboard_text(text):
 
 
 # ---------------------------------------------------------------------------
-# 剪贴板实时句读保护器 (基于 Unicode CL 属性避头尾禁则与排版绑定)
+# 剪贴板实时句读保护器 (严格保持半角/全角原生角态规范)
 # ---------------------------------------------------------------------------
 class ClipboardGuard:
     def needs_protection(self, text: str) -> bool:
@@ -336,50 +336,31 @@ class ClipboardGuard:
     def protect_text(self, text: str) -> str:
         if not text:
             return ''
-        # 1. 彻底清除旧版本遗留的零宽连接符与非标标点，杜绝任何历史残留
+        # 1. 清理旧版可能遗留的连接符与非标标点
         text = text.replace('\u2060', '')
-        text = text.replace('․', '.').replace('‚', ',')
 
-        # 2. 剥离标点前异常的多余空白符，并映射为 Unicode CL (Close Punctuation) 类标点
-        # ﹒(U+FE52 Small Full Stop) 与 ﹐(U+FE50 Small Comma) 具有 CL 闭合标点属性：
-        # (1) 不使用任何 Cf 零宽控制符，杜绝底层 ASR 语音模型切词导致的句号前多出空格问题；
-        # (2) 在 Qt/剪映文字排版引擎中天然继承 UAX #14 [^\s] × CL 禁则，
-        #     绝对禁止在标点前单独换行，彻底消除末尾句号落单成行的排版缺陷。
-        text = re.sub(r'[ \t\u3000]*[。.\ufe52]', '﹒', text)
-        text = re.sub(r'[ \t\u3000]*[，,\ufe50]', '﹐', text)
+        # 2. 严格遵循半角/全角原生角态规则：
+        #    英文/半角标点 -> 严格映射为半角专用标点，杜绝变全角：
+        #      英文句号 . -> ․ (U+2024 半角单点导引符，无空格紧贴单词，绝不落单分行)
+        #      英文逗号 , -> ‚ (U+201A 半角单下引号/逗号)
+        #    中文/全角标点 -> 严格映射为全角专用标点：
+        #      中文句号 。 -> ﹒ (U+FE52 全角小型句号)
+        #      中文逗号 ， -> ﹐ (U+FE50 全角小型逗号)
+        # 剥离标点前异常的多余空白符，绝不添加零宽字符，杜绝切词异常空格
+        text = re.sub(r'[ \t\u3000]*\.', '․', text)
+        text = re.sub(r'[ \t\u3000]*,', '‚', text)
+        text = re.sub(r'[ \t\u3000]*。', '﹒', text)
+        text = re.sub(r'[ \t\u3000]*，', '﹐', text)
         return text
 
     def restore_text(self, text: str) -> str:
         if not text:
             return ''
-        # 1. 连续 2 个及以上的 ﹒ 还原为标准英文连续省略号 ...
-        text = re.sub(r'﹒{2,}', lambda m: '.' * len(m.group(0)), text)
-
-        # 2. 上下文感知自适应还原：
-        # 处于西文/数字语境时还原为半角 ASCII 标点，处于中文语境时还原为全角标点
-        def repl_dot(m):
-            idx = m.start()
-            start = max(0, idx - 15)
-            end = min(len(text), idx + 15)
-            window = text[start:end]
-            if any('\u4e00' <= c <= '\u9fff' for c in window):
-                return '。'
-            return '.'
-
-        def repl_comma(m):
-            idx = m.start()
-            start = max(0, idx - 15)
-            end = min(len(text), idx + 15)
-            window = text[start:end]
-            if any('\u4e00' <= c <= '\u9fff' for c in window):
-                return '，'
-            return ','
-
-        text = re.sub(r'﹒', repl_dot, text)
-        text = re.sub(r'﹐', repl_comma, text)
-
-        # 兼容清理旧版残留
-        text = text.replace('․', '.').replace('‚', ',').replace('\u2060', '')
+        text = text.replace('\u2060', '')
+        # 半角标点原生还原
+        text = text.replace('․', '.').replace('‚', ',')
+        # 全角标点原生还原
+        text = text.replace('﹒', '。').replace('﹐', '，')
         return text
 
 
